@@ -1,8 +1,8 @@
 package by.dlstudio.server;
 
 import org.apache.commons.cli.*;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.Logger;
 
 import java.io.IOException;
 import java.net.ServerSocket;
@@ -14,7 +14,7 @@ public class HttpServer {
     private final int port;
     private final String rootDirectory;
     private final Map<String, String> defaultHeaders;
-    private final Logger logger = LogManager.getLogger();
+    private final Logger logger = LoggerFactory.getLogger(HttpServer.class);
 
     public HttpServer(int port, String rootDirectory, Map<String, String> defaultHeaders) {
         this.port = port;
