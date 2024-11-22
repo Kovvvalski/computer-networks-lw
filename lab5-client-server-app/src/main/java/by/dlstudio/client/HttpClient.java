@@ -4,9 +4,7 @@ import org.apache.commons.cli.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.net.Socket;
 import java.net.URL;
 import java.nio.file.Files;
@@ -14,12 +12,12 @@ import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
 
-
 public class HttpClient {
     private static final Logger logger = LoggerFactory.getLogger(HttpClient.class);
     private final String host;
     private final int port;
     private final Map<String, String> defaultHeaders;
+    private static final int BUFFER_SIZE = 8192;
 
     public HttpClient(String host, int port) {
         this.host = host;
@@ -40,30 +38,34 @@ public class HttpClient {
                 return;
             }
 
-            // Парсинг URL
             String url = cmd.getOptionValue("url");
             if (url == null) {
                 throw new ParseException("URL is required");
             }
             URL parsedUrl = new URL(url);
 
-            // Создание клиента
             HttpClient client = new HttpClient(
                     parsedUrl.getHost(),
                     parsedUrl.getPort() == -1 ? parsedUrl.getDefaultPort() : parsedUrl.getPort()
             );
 
-            // Обработка шаблона, если указан
+            String outputPath = cmd.getOptionValue("output");
+            if (outputPath == null) {
+                String fileName = new File(parsedUrl.getPath()).getName();
+                if (fileName.isEmpty()) {
+                    fileName = "index.html";
+                }
+                outputPath = fileName;
+            }
+
             if (cmd.hasOption("template")) {
-                client.executeTemplate(cmd.getOptionValue("template"));
+                client.executeTemplate(cmd.getOptionValue("template"), outputPath);
                 return;
             }
 
-            // Подготовка запроса
             String method = cmd.getOptionValue("method", "GET");
             String path = parsedUrl.getPath().isEmpty() ? "/" : parsedUrl.getPath();
 
-            // Сбор заголовков
             Map<String, String> headers = new HashMap<>();
             if (cmd.hasOption("header")) {
                 for (String header : cmd.getOptionValues("header")) {
@@ -74,7 +76,6 @@ public class HttpClient {
                 }
             }
 
-            // Подготовка тела запроса
             String body = null;
             if (cmd.hasOption("data")) {
                 body = cmd.getOptionValue("data");
@@ -82,8 +83,7 @@ public class HttpClient {
                 body = Files.readString(Paths.get(cmd.getOptionValue("file")));
             }
 
-            // Выполнение запроса
-            client.sendRequest(method, path, headers, body);
+            client.sendRequest(method, path, headers, body, outputPath);
 
         } catch (ParseException e) {
             System.err.println("Error parsing arguments: " + e.getMessage());
@@ -100,7 +100,6 @@ public class HttpClient {
                 .longOpt("url")
                 .hasArg()
                 .desc("Target URL (required)")
-                .required()
                 .build());
 
         options.addOption(Option.builder("X")
@@ -133,6 +132,12 @@ public class HttpClient {
                 .desc("Request template file")
                 .build());
 
+        options.addOption(Option.builder("o")
+                .longOpt("output")
+                .hasArg()
+                .desc("Output file path")
+                .build());
+
         options.addOption(Option.builder("h")
                 .longOpt("help")
                 .desc("Show this help message")
@@ -146,45 +151,43 @@ public class HttpClient {
         formatter.setWidth(100);
         formatter.printHelp("java -jar client.jar", "\nHTTP Client Options:", options,
                 "\nExamples:\n" +
-                        "  java -jar client.jar -u http://example.com/api/data\n" +
+                        "  java -jar client.jar -u http://example.com/file.pdf -o downloaded.pdf\n" +
                         "  java -jar client.jar -X POST -u http://example.com/api/data -d '{\"key\":\"value\"}'\n" +
                         "  java -jar client.jar -u http://example.com -H \"Content-Type: application/json\" -f data.json\n" +
-                        "  java -jar client.jar -t request-template.txt\n",
+                        "  java -jar client.jar -t request-template.txt -o response.txt\n",
                 true);
     }
 
-    public void executeTemplate(String templatePath) throws IOException {
+    public void executeTemplate(String templatePath, String outputPath) throws IOException {
         RequestTemplate template = RequestTemplate.fromFile(templatePath);
         sendRequest(
                 template.getMethod(),
                 template.getPath(),
                 template.getHeaders(),
-                template.getBody()
+                template.getBody(),
+                outputPath
         );
     }
 
     public void sendRequest(String method, String path,
                             Map<String, String> headers,
-                            String body) throws IOException {
+                            String body,
+                            String outputPath) throws IOException {
         try (Socket socket = new Socket(host, port)) {
-            socket.setSoTimeout(30000); // 30 секунд таймаут
+            socket.setSoTimeout(30000);
 
-            // Формирование запроса
             StringBuilder request = new StringBuilder();
             request.append(method).append(" ").append(path).append(" HTTP/1.1\r\n");
             request.append("Host: ").append(host).append("\r\n");
 
-            // Добавление дефолтных заголовков
             defaultHeaders.forEach((key, value) ->
                     request.append(key).append(": ").append(value).append("\r\n")
             );
 
-            // Добавление пользовательских заголовков
             headers.forEach((key, value) ->
                     request.append(key).append(": ").append(value).append("\r\n")
             );
 
-            // Добавление тела запроса
             if (body != null && !body.isEmpty()) {
                 request.append("Content-Length: ").append(body.getBytes().length).append("\r\n");
                 request.append("\r\n").append(body);
@@ -192,63 +195,122 @@ public class HttpClient {
                 request.append("\r\n");
             }
 
-            // Отправка запроса
             logger.debug("Sending request:\n{}", request);
             socket.getOutputStream().write(request.toString().getBytes());
 
-            // Чтение ответа
-            processResponse(socket);
+            processResponse(socket, outputPath);
         }
     }
 
-    private void processResponse(Socket socket) throws IOException {
+    private void processResponse(Socket socket, String outputPath) throws IOException {
         BufferedReader reader = new BufferedReader(
                 new InputStreamReader(socket.getInputStream())
         );
 
-        // Чтение статуса и заголовков
         String statusLine = reader.readLine();
         System.out.println(statusLine);
 
-        // Чтение заголовков
+        if (!statusLine.contains("200")) {
+            System.err.println("Error: Server returned status " + statusLine);
+            return;
+        }
+
+        Map<String, String> responseHeaders = new HashMap<>();
         String line;
         int contentLength = 0;
         boolean chunked = false;
 
         while ((line = reader.readLine()) != null && !line.isEmpty()) {
             System.out.println(line);
-            if (line.toLowerCase().startsWith("content-length:")) {
-                contentLength = Integer.parseInt(line.substring(15).trim());
-            }
-            if (line.toLowerCase().startsWith("transfer-encoding: chunked")) {
-                chunked = true;
+            String[] parts = line.split(": ", 2);
+            if (parts.length == 2) {
+                responseHeaders.put(parts[0].toLowerCase(), parts[1]);
+                if (parts[0].toLowerCase().equals("content-length")) {
+                    contentLength = Integer.parseInt(parts[1]);
+                }
+                if (parts[0].toLowerCase().equals("transfer-encoding") &&
+                        parts[1].toLowerCase().equals("chunked")) {
+                    chunked = true;
+                }
             }
         }
 
-        // Чтение тела ответа
-        if (chunked) {
-            readChunkedBody(reader);
-        } else if (contentLength > 0) {
-            readFixedLengthBody(reader, contentLength);
+        File outputFile = new File(outputPath);
+        if (outputFile.getParentFile() != null) {
+            outputFile.getParentFile().mkdirs();
         }
+
+        try (FileOutputStream fos = new FileOutputStream(outputFile)) {
+            if (chunked) {
+                readChunkedBody(reader, fos, socket);
+            } else if (contentLength > 0) {
+                readFixedLengthBody(socket.getInputStream(), fos, contentLength);
+            }
+        }
+
+        System.out.println("\nFile saved successfully: " + outputPath);
     }
 
-    private void readChunkedBody(BufferedReader reader) throws IOException {
+    private void readChunkedBody(BufferedReader reader, FileOutputStream fos, Socket socket) throws IOException {
         String lengthLine;
+        byte[] buffer = new byte[BUFFER_SIZE];
+        InputStream is = socket.getInputStream();
+
         while ((lengthLine = reader.readLine()) != null) {
             int chunkLength = Integer.parseInt(lengthLine.trim(), 16);
             if (chunkLength == 0) break;
 
-            char[] chunk = new char[chunkLength];
-            reader.read(chunk, 0, chunkLength);
-            System.out.print(new String(chunk));
-            reader.readLine(); // Пропуск CRLF после чанка
+            int bytesRead;
+            int remaining = chunkLength;
+
+            while (remaining > 0 && (bytesRead = is.read(buffer, 0,
+                    Math.min(buffer.length, remaining))) != -1) {
+                fos.write(buffer, 0, bytesRead);
+                remaining -= bytesRead;
+                printProgress(chunkLength - remaining, chunkLength);
+            }
+
+            reader.readLine();
         }
     }
 
-    private void readFixedLengthBody(BufferedReader reader, int contentLength) throws IOException {
-        char[] body = new char[contentLength];
-        reader.read(body, 0, contentLength);
-        System.out.print(new String(body));
+    private void readFixedLengthBody(InputStream is, FileOutputStream fos,
+                                     int contentLength) throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
+        int bytesRead;
+        int totalBytesRead = 0;
+
+        while (totalBytesRead < contentLength &&
+                (bytesRead = is.read(buffer, 0,
+                        Math.min(buffer.length, contentLength - totalBytesRead))) != -1) {
+            fos.write(buffer, 0, bytesRead);
+            totalBytesRead += bytesRead;
+            printProgress(totalBytesRead, contentLength);
+        }
+    }
+
+    private void printProgress(long current, long total) {
+        int width = 50;
+        double percentage = (double) current / total;
+        int progress = (int) (width * percentage);
+
+        StringBuilder bar = new StringBuilder("[");
+        for (int i = 0; i < width; i++) {
+            if (i < progress) {
+                bar.append("=");
+            } else if (i == progress) {
+                bar.append(">");
+            } else {
+                bar.append(" ");
+            }
+        }
+        bar.append("] ")
+                .append(String.format("%.1f%%", percentage * 100))
+                .append(String.format(" (%d/%d bytes)", current, total));
+
+        System.out.print("\r" + bar);
+        if (current >= total) {
+            System.out.println();
+        }
     }
 }
